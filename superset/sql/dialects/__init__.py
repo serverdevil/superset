@@ -17,5 +17,6 @@
 
 from .dremio import Dremio
 from .firebolt import Firebolt, FireboltOld
+from .opensearch import Opensearch
 
-__all__ = ["Dremio", "Firebolt", "FireboltOld"]
+__all__ = ["Dremio", "Firebolt", "FireboltOld", "Opensearch"]

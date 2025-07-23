@@ -44,7 +44,7 @@ from sqlglot.optimizer.scope import (  # pylint: disable=disallowed-sql-import
 )
 
 from superset.exceptions import QueryClauseValidationException, SupersetParseError
-from superset.sql.dialects import Dremio, Firebolt
+from superset.sql.dialects import Dremio, Firebolt, Opensearch
 
 if TYPE_CHECKING:
     from superset.models.core import Database
@@ -91,7 +91,7 @@ SQLGLOT_DIALECTS = {
     "netezza": Dialects.POSTGRES,
     "oceanbase": Dialects.MYSQL,
     # "ocient": ???
-    # "odelasticsearch": ???
+    "odelasticsearch": Opensearch,
     "oracle": Dialects.ORACLE,
     "parseable": Dialects.POSTGRES,
     "pinot": Dialects.MYSQL,
