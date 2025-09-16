@@ -26,7 +26,16 @@ import re
 import uuid
 from collections.abc import Hashable
 from datetime import datetime, timedelta
-from typing import Any, cast, NamedTuple, Optional, TYPE_CHECKING, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    NamedTuple,
+    Optional,
+    TYPE_CHECKING,
+    TypedDict,
+    Union,
+)
 
 import dateutil.parser
 import humanize
@@ -35,12 +44,12 @@ import pandas as pd
 import pytz
 import sqlalchemy as sa
 import yaml
-from flask import g
+from flask import current_app as app, g
 from flask_appbuilder import Model
 from flask_appbuilder.models.decorators import renders
 from flask_appbuilder.models.mixins import AuditMixin
 from flask_appbuilder.security.sqla.models import User
-from flask_babel import lazy_gettext as _
+from flask_babel import get_locale, lazy_gettext as _
 from jinja2.exceptions import TemplateError
 from markupsafe import escape, Markup
 from sqlalchemy import and_, Column, or_, UniqueConstraint
@@ -52,7 +61,7 @@ from sqlalchemy.sql.expression import Label, Select, TextAsFrom
 from sqlalchemy.sql.selectable import Alias, TableClause
 from sqlalchemy_utils import UUIDType
 
-from superset import app, db, is_feature_enabled
+from superset import db, is_feature_enabled
 from superset.advanced_data_type.types import AdvancedDataTypeResponse
 from superset.common.db_query_status import QueryStatus
 from superset.common.utils.time_range_utils import get_since_until_from_time_range
@@ -65,6 +74,7 @@ from superset.exceptions import (
     QueryClauseValidationException,
     QueryObjectValidationError,
     SupersetSecurityException,
+    SupersetSyntaxErrorException,
 )
 from superset.extensions import feature_flag_manager
 from superset.jinja_context import BaseTemplateProcessor
@@ -87,22 +97,28 @@ from superset.utils.core import (
     is_adhoc_column,
     MediumText,
     remove_duplicates,
+    SqlExpressionType,
 )
 from superset.utils.dates import datetime_to_epoch
 from superset.utils.rls import apply_rls
+
+
+class ValidationResultDict(TypedDict):
+    """Type for validation result objects returned by validate_expression."""
+
+    valid: bool
+    errors: list[dict[str, Any]]
+
 
 if TYPE_CHECKING:
     from superset.connectors.sqla.models import SqlMetric, TableColumn
     from superset.db_engine_specs import BaseEngineSpec
     from superset.models.core import Database
 
-
-config = app.config
 logger = logging.getLogger(__name__)
 
 VIRTUAL_TABLE_ALIAS = "virtual_table"
 SERIES_LIMIT_SUBQ_ALIAS = "series_limit"
-ADVANCED_DATA_TYPES = config["ADVANCED_DATA_TYPES"]
 
 
 def validate_adhoc_subquery(
@@ -544,13 +560,28 @@ class AuditMixinNullable(AuditMixin):
         # Convert naive datetime to UTC
         return self.changed_on.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%S.%f%z")
 
+    def _format_time_humanized(self, timestamp: datetime) -> str:
+        locale = str(get_locale())
+        time_diff = datetime.now() - timestamp
+        # Skip activation for 'en' locale as it's humanize's default locale
+        if locale == "en":
+            return humanize.naturaltime(time_diff)
+        try:
+            humanize.i18n.activate(locale)
+            result = humanize.naturaltime(time_diff)
+            humanize.i18n.deactivate()
+            return result
+        except Exception as e:
+            logger.warning("Locale '%s' is not supported in humanize: %s", locale, e)
+            return humanize.naturaltime(time_diff)
+
     @property
     def changed_on_humanized(self) -> str:
-        return humanize.naturaltime(datetime.now() - self.changed_on)
+        return self._format_time_humanized(self.changed_on)
 
     @property
     def created_on_humanized(self) -> str:
-        return humanize.naturaltime(datetime.now() - self.created_on)
+        return self._format_time_humanized(self.created_on)
 
     @renders("changed_on")
     def modified(self) -> Markup:
@@ -1052,11 +1083,17 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         if template_processor:
             try:
                 sql = template_processor.process_template(sql)
-            except TemplateError as ex:
+            except (TemplateError, SupersetSyntaxErrorException) as ex:
+                # Extract error message from different exception types
+                if isinstance(ex, TemplateError):
+                    error_msg = ex.message
+                else:  # SupersetSyntaxErrorException
+                    error_msg = str(ex.errors[0].message if ex.errors else ex)
+
                 raise QueryObjectValidationError(
                     _(
                         "Error while rendering virtual dataset query: %(msg)s",
-                        msg=ex.message,
+                        msg=error_msg,
                     )
                 ) from ex
 
@@ -1258,6 +1295,67 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
 
         return or_(*groups)
 
+    def _apply_series_others_grouping(
+        self,
+        select_exprs: list[Any],
+        groupby_all_columns: dict[str, Any],
+        groupby_series_columns: dict[str, Any],
+        condition_factory: Callable[[str, Any], Any],
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """
+        Apply "Others" grouping to series columns in both SELECT and GROUP BY clauses.
+
+        This method encapsulates the common logic for replacing series columns with
+        CASE expressions that group remaining series into an "Others" category when
+        the series limit is reached.
+
+        Args:
+            select_exprs: List of SELECT expressions to modify
+            groupby_all_columns: Dict of GROUP BY columns to modify
+            groupby_series_columns: Dict of series columns to apply Others grouping to
+            condition_factory: Function that takes (col_name, original_expr) and returns
+                the condition for when to keep original value vs use "Others"
+
+        Returns:
+            Tuple of (modified_select_exprs, modified_groupby_all_columns)
+        """
+        # Modify SELECT expressions
+        modified_select_exprs = []
+        for expr in select_exprs:
+            if hasattr(expr, "name") and expr.name in groupby_series_columns:
+                # Create condition for this column using the factory function
+                condition = condition_factory(expr.name, expr)
+
+                # Create CASE expression: condition true -> original, else "Others"
+                case_expr = sa.case([(condition, expr)], else_=sa.literal("Others"))
+                case_expr = self.make_sqla_column_compatible(case_expr, expr.name)
+                modified_select_exprs.append(case_expr)
+            else:
+                modified_select_exprs.append(expr)
+
+        # Modify GROUP BY expressions
+        modified_groupby_all_columns = {}
+        for col_name, gby_expr in groupby_all_columns.items():
+            if col_name in groupby_series_columns:
+                # Create condition for this column using the factory function
+                condition = condition_factory(col_name, gby_expr)
+
+                # Create CASE expression for groupby
+                case_expr = sa.case(
+                    [(condition, gby_expr)],
+                    else_=sa.literal("Others"),
+                )
+                # Don't apply make_sqla_column_compatible to GROUP BY expressions.
+                # When make_sqla_column_compatible adds a label to the expression,
+                # it can cause SQLAlchemy to incorrectly render string literals
+                # without quotes in the GROUP BY clause (e.g., "ELSE Others"
+                # instead of "ELSE 'Others'")
+                modified_groupby_all_columns[col_name] = case_expr
+            else:
+                modified_groupby_all_columns[col_name] = gby_expr
+
+        return modified_select_exprs, modified_groupby_all_columns
+
     def dttm_sql_literal(self, dttm: datetime, col: "TableColumn") -> str:
         """Convert datetime object to a SQL expression string"""
 
@@ -1363,22 +1461,131 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             qry = qry.where(self.get_fetch_values_predicate(template_processor=tp))
 
         rls_filters = self.get_sqla_row_level_filters(template_processor=tp)
-        qry = qry.where(and_(*rls_filters))
+        if rls_filters:
+            qry = qry.where(and_(*rls_filters))
 
         with self.database.get_sqla_engine() as engine:
             sql = str(qry.compile(engine, compile_kwargs={"literal_binds": True}))
             sql = self._apply_cte(sql, cte)
-            sql = self.database.mutate_sql_based_on_config(sql)
 
             # pylint: disable=protected-access
             if engine.dialect.identifier_preparer._double_percents:
                 sql = sql.replace("%%", "%")
+
+            sql = self.database.mutate_sql_based_on_config(sql)
 
             with engine.connect() as con:
                 df = pd.read_sql_query(sql=self.text(sql), con=con)
                 # replace NaN with None to ensure it can be serialized to JSON
                 df = df.replace({np.nan: None})
                 return df["column_values"].to_list()
+
+    def validate_expression(
+        self,
+        expression: str,
+        expression_type: SqlExpressionType = SqlExpressionType.WHERE,
+    ) -> ValidationResultDict:
+        """
+        Validate a SQL expression against this datasource.
+
+        :param expression: SQL expression to validate
+        :param expression_type: Type of expression (column, metric, where, having)
+        :return: Dict with validation result and any errors
+        """
+
+        from superset.sql_validators.base import SQLValidationAnnotation
+
+        try:
+            # Process template
+            tp = self.get_template_processor()
+            processed_expression = self._process_expression_template(expression, tp)
+
+            # Build validation query
+            tbl, cte = self.get_from_clause(tp)
+            validation_query = self._build_validation_query(
+                processed_expression, expression_type
+            )
+
+            # Execute validation
+            return self._execute_validation_query(
+                validation_query, tbl, cte or "", tp, processed_expression
+            )
+        except Exception as ex:
+            # Convert any exception to validation error format
+            error_msg = str(getattr(ex, "orig", ex))
+            return ValidationResultDict(
+                valid=False,
+                errors=[
+                    SQLValidationAnnotation(
+                        message=error_msg,
+                        line_number=1,
+                        start_column=0,
+                        end_column=len(expression),
+                    ).to_dict()
+                ],
+            )
+
+    def _process_expression_template(
+        self, expression: str, tp: Optional[BaseTemplateProcessor]
+    ) -> str:
+        """Process expression through template processor. Raises on error."""
+        if not tp:
+            return expression
+
+        if hasattr(tp, "process_template"):
+            return tp.process_template(expression)
+        return expression
+
+    def _build_validation_query(
+        self, expression: str, expression_type: SqlExpressionType
+    ) -> Select:
+        """Build validation query based on expression type. Raises on error."""
+        if expression_type == SqlExpressionType.COLUMN:
+            return sa.select([sa.literal_column(expression).label("test_col")])
+        elif expression_type == SqlExpressionType.METRIC:
+            return sa.select([sa.literal_column(expression).label("test_metric")])
+        elif expression_type == SqlExpressionType.WHERE:
+            return sa.select([sa.literal(1)]).where(sa.text(expression))
+        elif expression_type == SqlExpressionType.HAVING:
+            dummy_col = sa.literal("A").label("dummy")
+            return (
+                sa.select([dummy_col])
+                .group_by(sa.text("dummy"))
+                .having(sa.text(expression))
+            )
+        else:
+            raise ValueError(f"Unsupported expression type: {expression_type}")
+
+    def _execute_validation_query(
+        self,
+        validation_query: Select,
+        tbl: TableClause | Alias,
+        cte: str,
+        tp: Optional[BaseTemplateProcessor],
+        expression: str,
+    ) -> ValidationResultDict:
+        """Execute validation query and return result."""
+        # Add FROM clause and prevent execution
+        validation_query = validation_query.select_from(tbl).where(sa.literal(False))
+
+        # Apply row-level security filters
+        rls_filters = self.get_sqla_row_level_filters(template_processor=tp)
+        if rls_filters:
+            validation_query = validation_query.where(and_(*rls_filters))
+
+        with self.database.get_sqla_engine() as engine:
+            sql = str(
+                validation_query.compile(engine, compile_kwargs={"literal_binds": True})
+            )
+            sql = self._apply_cte(sql, cte)
+
+            sql = self.database.mutate_sql_based_on_config(sql)
+
+            # Execute to validate without fetching data
+            with engine.connect() as con:
+                con.execute(self.text(sql))
+
+            return ValidationResultDict(valid=True, errors=[])
 
     def get_timestamp_expression(
         self,
@@ -1449,6 +1656,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         series_columns: Optional[list[Column]] = None,
         series_limit: Optional[int] = None,
         series_limit_metric: Optional[Metric] = None,
+        group_others_when_limit_reached: bool = False,
         row_limit: Optional[int] = None,
         row_offset: Optional[int] = None,
         timeseries_limit: Optional[int] = None,
@@ -1808,6 +2016,10 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     is_list_target=is_list_target,
                     db_engine_spec=db_engine_spec,
                 )
+
+                # Get ADVANCED_DATA_TYPES from config when needed
+                ADVANCED_DATA_TYPES = app.config.get("ADVANCED_DATA_TYPES", {})  # noqa: N806
+
                 if (
                     col_advanced_data_type != ""
                     and feature_flag_manager.is_feature_enabled(
@@ -2040,7 +2252,43 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     col_name = db_engine_spec.make_label_compatible(gby_name + "__")
                     on_clause.append(gby_obj == sa.column(col_name))
 
-                tbl = tbl.join(subq.alias(SERIES_LIMIT_SUBQ_ALIAS), and_(*on_clause))
+                # Use LEFT JOIN when grouping others, INNER JOIN otherwise
+                if group_others_when_limit_reached:
+                    # Create the alias once and reuse it
+                    subq_alias = subq.alias(SERIES_LIMIT_SUBQ_ALIAS)
+                    tbl = tbl.join(
+                        subq_alias,
+                        and_(*on_clause),
+                        isouter=True,
+                    )
+
+                    # Apply Others grouping using the refactored method
+                    def _create_join_condition(col_name: str, expr: Any) -> Any:
+                        # Get the corresponding column from the subquery
+                        subq_col_name = db_engine_spec.make_label_compatible(
+                            col_name + "__"
+                        )
+                        # Reference the column from the already-created aliased subquery
+                        subq_col = subq_alias.c[subq_col_name]
+                        return subq_col.is_not(None)
+
+                    select_exprs, groupby_all_columns = (
+                        self._apply_series_others_grouping(
+                            select_exprs,
+                            groupby_all_columns,
+                            groupby_series_columns,
+                            _create_join_condition,
+                        )
+                    )
+
+                    # Reconstruct query with modified expressions
+                    qry = sa.select(select_exprs)
+                    if groupby_all_columns:
+                        qry = qry.group_by(*groupby_all_columns.values())
+                else:
+                    tbl = tbl.join(
+                        subq.alias(SERIES_LIMIT_SUBQ_ALIAS), and_(*on_clause)
+                    )
             else:
                 if series_limit_metric:
                     orderby = [
@@ -2081,7 +2329,28 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 top_groups = self._get_top_groups(
                     result.df, dimensions, groupby_series_columns, columns_by_name
                 )
-                qry = qry.where(top_groups)
+
+                if group_others_when_limit_reached:
+                    # Apply Others grouping using the refactored method
+                    def _create_top_groups_condition(col_name: str, expr: Any) -> Any:
+                        return top_groups
+
+                    select_exprs, groupby_all_columns = (
+                        self._apply_series_others_grouping(
+                            select_exprs,
+                            groupby_all_columns,
+                            groupby_series_columns,
+                            _create_top_groups_condition,
+                        )
+                    )
+
+                    # Reconstruct query with modified expressions
+                    qry = sa.select(select_exprs)
+                    if groupby_all_columns:
+                        qry = qry.group_by(*groupby_all_columns.values())
+                else:
+                    # Original behavior: filter to only top groups
+                    qry = qry.where(top_groups)
 
         qry = qry.select_from(tbl)
 
