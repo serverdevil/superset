@@ -37,7 +37,6 @@ import {
   Menu,
   Icons,
   Typography,
-  TelemetryPixel,
 } from '@superset-ui/core/components';
 import type { ItemType, MenuItem } from '@superset-ui/core/components/Menu';
 import { ensureAppRoot } from 'src/utils/pathUtils';
@@ -734,11 +733,6 @@ const RightMenu = ({
           <Icons.LoginOutlined /> {t('Login')}
         </StyledAnchor>
       )}
-      <TelemetryPixel
-        version={navbarRight.version_string}
-        sha={navbarRight.version_sha}
-        build={navbarRight.build_number}
-      />
     </StyledDiv>
   );
 };

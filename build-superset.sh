@@ -27,9 +27,6 @@ INCLUDE_FIREFOX="${INCLUDE_FIREFOX:-false}"
 LOAD_EXAMPLES_DUCKDB="${LOAD_EXAMPLES_DUCKDB:-false}"
 TARGET="${TARGET:-lean}"
 
-# Disable Scarf analytics
-export SCARF_ANALYTICS=false
-
 echo "========================================"
 echo "Building Apache Superset Docker Image"
 echo "========================================"
@@ -39,7 +36,6 @@ echo "Build Translations: ${BUILD_TRANSLATIONS}"
 echo "Include Chromium: ${INCLUDE_CHROMIUM}"
 echo "Include Firefox: ${INCLUDE_FIREFOX}"
 echo "Load Examples DuckDB: ${LOAD_EXAMPLES_DUCKDB}"
-echo "Scarf Analytics: ${SCARF_ANALYTICS}"
 echo "========================================"
 echo ""
 
@@ -49,7 +45,6 @@ docker build \
   --build-arg INCLUDE_CHROMIUM="${INCLUDE_CHROMIUM}" \
   --build-arg INCLUDE_FIREFOX="${INCLUDE_FIREFOX}" \
   --build-arg LOAD_EXAMPLES_DUCKDB="${LOAD_EXAMPLES_DUCKDB}" \
-  --build-arg SCARF_ANALYTICS=false \
   -t "${IMAGE_NAME}:${IMAGE_TAG}" \
   .
 
