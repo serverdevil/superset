@@ -19,7 +19,7 @@
 set -e
 
 # Default values
-IMAGE_NAME="${IMAGE_NAME:-apache/superset}"
+IMAGE_NAME="${IMAGE_NAME:-superset-master}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 BUILD_TRANSLATIONS="${BUILD_TRANSLATIONS:-false}"
 INCLUDE_CHROMIUM="${INCLUDE_CHROMIUM:-false}"
